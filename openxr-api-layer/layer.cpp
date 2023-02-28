@@ -32,6 +32,8 @@
 namespace openxr_api_layer {
 
     using namespace log;
+    using namespace utils;
+    using namespace xr::math;
 
     // Our API layer implement these extensions, and their specified version.
     const std::vector<std::pair<std::string, uint32_t>> advertisedExtensions = {};
@@ -54,8 +56,17 @@ namespace openxr_api_layer {
                               TLArg(name, "Name"),
                               TLArg(m_bypassApiLayer, "Bypass"));
 
-            XrResult result = m_bypassApiLayer ? m_xrGetInstanceProcAddr(instance, name, function)
-                                               : OpenXrApi::xrGetInstanceProcAddr(instance, name, function);
+            XrResult result;
+            if (!m_bypassApiLayer) {
+                result = OpenXrApi::xrGetInstanceProcAddr(instance, name, function);
+
+                // Required to call this method for housekeeping.
+                if (m_compositionFrameworkFactory) {
+                    m_compositionFrameworkFactory->xrGetInstanceProcAddr_post(instance, name, function);
+                }
+            } else {
+                result = m_xrGetInstanceProcAddr(instance, name, function);
+            }
 
             TraceLoggingWrite(g_traceProvider, "xrGetInstanceProcAddr", TLPArg(*function, "Function"));
 
@@ -109,6 +120,10 @@ namespace openxr_api_layer {
             TraceLoggingWrite(g_traceProvider, "xrCreateInstance", TLArg(runtimeName.c_str(), "RuntimeName"));
             Log(fmt::format("Using OpenXR runtime: {}\n", runtimeName));
 
+            // Initialize the composition framework factory.
+            m_compositionFrameworkFactory = graphics::createCompositionFrameworkFactory(
+                *createInfo, GetXrInstance(), m_xrGetInstanceProcAddr, graphics::CompositionApi::D3D11);
+
             return XR_SUCCESS;
         }
 
@@ -125,15 +140,14 @@ namespace openxr_api_layer {
 
             const XrResult result = OpenXrApi::xrGetSystem(instance, getInfo, systemId);
             if (XR_SUCCEEDED(result) && getInfo->formFactor == XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY) {
-                if (*systemId != m_systemId) {
+                static bool wasSystemNameLogged = false;
+                if (!wasSystemNameLogged) {
                     XrSystemProperties systemProperties{XR_TYPE_SYSTEM_PROPERTIES};
                     CHECK_XRCMD(OpenXrApi::xrGetSystemProperties(instance, *systemId, &systemProperties));
                     TraceLoggingWrite(g_traceProvider, "xrGetSystem", TLArg(systemProperties.systemName, "SystemName"));
                     Log(fmt::format("Using OpenXR system: {}\n", systemProperties.systemName));
+                    wasSystemNameLogged = true;
                 }
-
-                // Remember the XrSystemId to use.
-                m_systemId = *systemId;
             }
 
             TraceLoggingWrite(g_traceProvider, "xrGetSystem", TLArg((int)*systemId, "SystemId"));
@@ -141,39 +155,151 @@ namespace openxr_api_layer {
             return result;
         }
 
-        // https://www.khronos.org/registry/OpenXR/specs/1.0/html/xrspec.html#xrCreateSession
-        XrResult xrCreateSession(XrInstance instance,
-                                 const XrSessionCreateInfo* createInfo,
-                                 XrSession* session) override {
-            if (createInfo->type != XR_TYPE_SESSION_CREATE_INFO) {
+        // https://www.khronos.org/registry/OpenXR/specs/1.0/html/xrspec.html#xrEndFrame
+        XrResult xrEndFrame(XrSession session, const XrFrameEndInfo* frameEndInfo) override {
+            if (frameEndInfo->type != XR_TYPE_FRAME_END_INFO) {
                 return XR_ERROR_VALIDATION_FAILURE;
             }
 
             TraceLoggingWrite(g_traceProvider,
-                              "xrCreateSession",
-                              TLXArg(instance, "Instance"),
-                              TLArg((int)createInfo->systemId, "SystemId"),
-                              TLArg(createInfo->createFlags, "CreateFlags"));
+                              "xrEndFrame",
+                              TLXArg(session, "Session"),
+                              TLArg(frameEndInfo->displayTime, "DisplayTime"),
+                              TLArg(frameEndInfo->layerCount, "LayerCount"));
 
-            const XrResult result = OpenXrApi::xrCreateSession(instance, createInfo, session);
-            if (XR_SUCCEEDED(result)) {
-                if (isSystemHandled(createInfo->systemId)) {
-                    // Do something useful here...
+            XrFrameEndInfo chainFrameEndInfo = *frameEndInfo;
+            std::vector<const XrCompositionLayerBaseHeader*> layers;
+            XrCompositionLayerQuad overlay{XR_TYPE_COMPOSITION_LAYER_QUAD};
+
+            // Handle the overlay.
+            graphics::ICompositionFramework* composition =
+                m_compositionFrameworkFactory->getCompositionFramework(session);
+            if (composition) {
+                CompositionData* compositionData = composition->getSessionData<CompositionData>();
+
+                // First time: initialize the resources for the session.
+                if (!compositionData) {
+                    // Allocate storage for the state.
+                    composition->setSessionData(std::move(std::make_unique<CompositionData>(*this)));
+                    compositionData = composition->getSessionData<CompositionData>();
+
+                    // Create a swapchain for the overlay.
+                    XrSwapchainCreateInfo overlaySwapchainInfo{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+                    overlaySwapchainInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+                    overlaySwapchainInfo.arraySize = 1;
+                    overlaySwapchainInfo.width = 512;
+                    overlaySwapchainInfo.height = 512;
+                    overlaySwapchainInfo.format =
+                        composition->getPreferredSwapchainFormatOnApplicationDevice(overlaySwapchainInfo.usageFlags);
+                    overlaySwapchainInfo.mipCount = overlaySwapchainInfo.sampleCount = overlaySwapchainInfo.faceCount =
+                        1;
+                    compositionData->overlaySwapchain = composition->createSwapchain(
+                        overlaySwapchainInfo, graphics::SwapchainMode::Write | graphics::SwapchainMode::Submit);
+
+                    // Create a head-locked reference space.
+                    XrReferenceSpaceCreateInfo createViewSpaceInfo{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+                    createViewSpaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
+                    createViewSpaceInfo.poseInReferenceSpace = Pose::Identity();
+                    CHECK_XRCMD(OpenXrApi::xrCreateReferenceSpace(
+                        composition->getSessionHandle(), &createViewSpaceInfo, &compositionData->viewSpace));
                 }
 
-                TraceLoggingWrite(g_traceProvider, "xrCreateSession", TLXArg(*session, "Session"));
+                // Draw the overlay content.
+                const XrSwapchainCreateInfo& swapchainInfo =
+                    compositionData->overlaySwapchain->getInfoOnCompositionDevice();
+                graphics::ISwapchainImage* const acquiredImage = compositionData->overlaySwapchain->acquireImage();
+                {
+                    ID3D11Device* const device =
+                        composition->getCompositionDevice()->getNativeDevice<graphics::D3D11>();
+                    ID3D11DeviceContext* const context =
+                        composition->getCompositionDevice()->getNativeContext<graphics::D3D11>();
+                    ID3D11Texture2D* const surface =
+                        acquiredImage->getTextureForWrite()->getNativeTexture<graphics::D3D11>();
+
+                    // Create an ephemeral render target view for the drawing.
+                    ComPtr<ID3D11RenderTargetView> rtv;
+                    D3D11_RENDER_TARGET_VIEW_DESC rtvDesc{};
+                    rtvDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+                    rtvDesc.Format = (DXGI_FORMAT)swapchainInfo.format;
+                    rtvDesc.Texture2D.MipSlice = D3D11CalcSubresource(0, 0, 1);
+                    CHECK_HRCMD(device->CreateRenderTargetView(surface, &rtvDesc, rtv.ReleaseAndGetAddressOf()));
+
+                    // Draw to the surface.
+                    // We keep the drawing code very simple for the sake of the exercise, but really any D3D11 technique
+                    // could be used.
+                    ComPtr<ID3D11DeviceContext1> context1;
+                    CHECK_HRCMD(context->QueryInterface(context1.ReleaseAndGetAddressOf()));
+                    context1->OMSetRenderTargets(1, rtv.GetAddressOf(), nullptr);
+
+                    const float background[4] = {0.0f, 0.0f, 0.0f, 0.2f};
+                    const float red[4] = {1.0f, 0.0f, 0.0f, 1.0f};
+                    const float green[4] = {0.0f, 1.0f, 0.0f, 1.0f};
+                    context1->ClearRenderTargetView(rtv.Get(), background);
+
+                    D3D11_RECT rect1;
+                    rect1.left = 10;
+                    rect1.top = 10;
+                    rect1.right = swapchainInfo.width / 2 - 10;
+                    rect1.bottom = swapchainInfo.height - 10;
+                    context1->ClearView(rtv.Get(), red, &rect1, 1);
+
+                    D3D11_RECT rect2;
+                    rect2.left = swapchainInfo.width / 2 + 10;
+                    rect2.top = 10;
+                    rect2.right = swapchainInfo.width - 10;
+                    rect2.bottom = swapchainInfo.height - 10;
+                    context1->ClearView(rtv.Get(), green, &rect2, 1);
+
+                    ID3D11RenderTargetView* nullRTV = nullptr;
+                    context1->OMSetRenderTargets(1, &nullRTV, nullptr);
+                }
+                compositionData->overlaySwapchain->releaseImage();
+                compositionData->overlaySwapchain->commitLastReleasedImage();
+
+                overlay.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+                overlay.subImage = compositionData->overlaySwapchain->getSubImage();
+
+                // Place the overlay.
+                // - Head-locked, since we are using XR_REFERENCE_SPACE_TYPE_VIEW;
+                // - 1m in front of the user, facing the user (no rotation);
+                // - 0.8m x 0.6m dimensions.
+                overlay.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+                overlay.pose = Pose::Translation({0.0f, 0.0f, -1.0f});
+                overlay.space = compositionData->viewSpace;
+                overlay.size.width = 0.8f;
+                overlay.size.height = 0.6f;
+
+                // Append our overlay quad layer.
+                layers.assign(chainFrameEndInfo.layers, chainFrameEndInfo.layers + chainFrameEndInfo.layerCount);
+                layers.push_back(reinterpret_cast<XrCompositionLayerBaseHeader*>(&overlay));
+                chainFrameEndInfo.layers = layers.data();
+                chainFrameEndInfo.layerCount = (uint32_t)layers.size();
             }
 
-            return result;
+            return OpenXrApi::xrEndFrame(session, &chainFrameEndInfo);
         }
 
       private:
-        bool isSystemHandled(XrSystemId systemId) const {
-            return systemId == m_systemId;
-        }
+        struct CompositionData : graphics::ICompositionSessionData {
+            CompositionData(OpenXrApi& openxr) : m_openxr(openxr) {
+            }
+
+            ~CompositionData() override {
+                if (viewSpace != XR_NULL_HANDLE) {
+                    m_openxr.xrDestroySpace(viewSpace);
+                }
+            }
+
+            XrSpace viewSpace{XR_NULL_HANDLE};
+            std::shared_ptr<graphics::ISwapchain> overlaySwapchain;
+
+          private:
+            OpenXrApi& m_openxr;
+        };
 
         bool m_bypassApiLayer{false};
-        XrSystemId m_systemId{XR_NULL_SYSTEM_ID};
+
+        std::shared_ptr<graphics::ICompositionFrameworkFactory> m_compositionFrameworkFactory;
     };
 
     // This method is required by the framework to instantiate your OpenXrApi implementation.
