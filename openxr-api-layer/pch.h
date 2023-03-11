@@ -31,6 +31,7 @@
 #define XR_USE_GRAPHICS_API_D3D12
 
 // Standard library.
+#include <array>
 #include <algorithm>
 #include <cstdarg>
 #include <ctime>

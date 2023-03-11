@@ -32,6 +32,10 @@
 namespace openxr_api_layer {
 
     using namespace log;
+    using namespace xr::math;
+
+    // The IPD we want to force the application to use.
+    constexpr float IPDOverride = 0.09f; // 9cm should make everything look small!
 
     // Our API layer implement these extensions, and their specified version.
     const std::vector<std::pair<std::string, uint32_t>> advertisedExtensions = {};
@@ -141,39 +145,158 @@ namespace openxr_api_layer {
             return result;
         }
 
-        // https://www.khronos.org/registry/OpenXR/specs/1.0/html/xrspec.html#xrCreateSession
-        XrResult xrCreateSession(XrInstance instance,
-                                 const XrSessionCreateInfo* createInfo,
-                                 XrSession* session) override {
-            if (createInfo->type != XR_TYPE_SESSION_CREATE_INFO) {
+        XrResult xrLocateViews(XrSession session,
+                               const XrViewLocateInfo* viewLocateInfo,
+                               XrViewState* viewState,
+                               uint32_t viewCapacityInput,
+                               uint32_t* viewCountOutput,
+                               XrView* views) override {
+            if (viewLocateInfo->type != XR_TYPE_VIEW_LOCATE_INFO || viewState->type != XR_TYPE_VIEW_STATE) {
                 return XR_ERROR_VALIDATION_FAILURE;
             }
 
             TraceLoggingWrite(g_traceProvider,
-                              "xrCreateSession",
-                              TLXArg(instance, "Instance"),
-                              TLArg((int)createInfo->systemId, "SystemId"),
-                              TLArg(createInfo->createFlags, "CreateFlags"));
+                              "xrLocateViews",
+                              TLXArg(session, "Session"),
+                              TLArg(xr::ToCString(viewLocateInfo->viewConfigurationType), "ViewConfigurationType"),
+                              TLArg(viewLocateInfo->displayTime, "DisplayTime"),
+                              TLXArg(viewLocateInfo->space, "Space"),
+                              TLArg(viewCapacityInput, "ViewCapacityInput"));
 
-            const XrResult result = OpenXrApi::xrCreateSession(instance, createInfo, session);
-            if (XR_SUCCEEDED(result)) {
-                if (isSystemHandled(createInfo->systemId)) {
-                    // Do something useful here...
+            // Invoke the real implementation.
+            const XrResult result =
+                OpenXrApi::xrLocateViews(session, viewLocateInfo, viewState, viewCapacityInput, viewCountOutput, views);
+
+            TraceLoggingWrite(g_traceProvider, "xrLocateViews", TLArg(*viewCountOutput, "ViewCountOutput"));
+
+            if (XR_SUCCEEDED(result) && viewCapacityInput) {
+                // If this is a stereoscopic view, apply our IPD override.
+                if (viewLocateInfo->viewConfigurationType == XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO) {
+                    assert(*viewCountOutput == xr::StereoView::Count);
+
+                    const bool isDeactivateKeyPressed = GetAsyncKeyState(VK_END) < 0;
+                    if (!isDeactivateKeyPressed) {
+                        // Patch the views with our IPD before returning to the application.
+                        // Store the actual IPD as reported by the runtime so we can restore it later in xrEndFrame().
+                        m_lastSeenIPD = overrideIPD(
+                            views[xr::StereoView::Left].pose, views[xr::StereoView::Right].pose, IPDOverride);
+                    } else {
+                        m_lastSeenIPD.reset();
+                    }
                 }
 
-                TraceLoggingWrite(g_traceProvider, "xrCreateSession", TLXArg(*session, "Session"));
+                for (uint32_t i = 0; i < *viewCountOutput; i++) {
+                    TraceLoggingWrite(
+                        g_traceProvider, "xrLocateViews", TLArg(viewState->viewStateFlags, "ViewStateFlags"));
+                    TraceLoggingWrite(g_traceProvider,
+                                      "xrLocateViews",
+                                      TLArg(xr::ToString(views[i].pose).c_str(), "Pose"),
+                                      TLArg(xr::ToString(views[i].fov).c_str(), "Fov"));
+                }
             }
 
             return result;
         }
 
+        XrResult xrEndFrame(XrSession session, const XrFrameEndInfo* frameEndInfo) override {
+            if (frameEndInfo->type != XR_TYPE_FRAME_END_INFO) {
+                return XR_ERROR_VALIDATION_FAILURE;
+            }
+
+            TraceLoggingWrite(g_traceProvider,
+                              "xrEndFrame",
+                              TLXArg(session, "Session"),
+                              TLArg(frameEndInfo->displayTime, "DisplayTime"),
+                              TLArg(xr::ToCString(frameEndInfo->environmentBlendMode), "EnvironmentBlendMode"));
+
+            // We will need to create copies of some structures, because they are passed const from the application so
+            // we cannot modify them in-place.
+            XrFrameEndInfo chainFrameEndInfo = *frameEndInfo;
+            std::vector<XrCompositionLayerProjection> projAllocator;
+            projAllocator.reserve(frameEndInfo->layerCount);
+            std::vector<std::array<XrCompositionLayerProjectionView, 2>> projViewsAllocator;
+            projViewsAllocator.reserve(frameEndInfo->layerCount);
+            std::vector<const XrCompositionLayerBaseHeader*> layersPtrAllocator;
+            layersPtrAllocator.reserve(frameEndInfo->layerCount);
+
+            for (uint32_t i = 0; i < frameEndInfo->layerCount; i++) {
+                if (!frameEndInfo->layers[i]) {
+                    return XR_ERROR_LAYER_INVALID;
+                }
+
+                TraceLoggingWrite(g_traceProvider,
+                                  "xrEndFrame_Layer",
+                                  TLArg(xr::ToCString(frameEndInfo->layers[i]->type), "Type"),
+                                  TLArg(frameEndInfo->layers[i]->layerFlags, "Flags"),
+                                  TLXArg(frameEndInfo->layers[i]->space, "Space"));
+
+                // Patch the IPD back for all projection layers with stereoscopic views.
+                if (frameEndInfo->layers[i]->type == XR_TYPE_COMPOSITION_LAYER_PROJECTION) {
+                    const XrCompositionLayerProjection* proj =
+                        reinterpret_cast<const XrCompositionLayerProjection*>(frameEndInfo->layers[i]);
+
+                    if (proj->viewCount == xr::StereoView::Count && m_lastSeenIPD) {
+                        // Create our copies of the structures we will modify.
+                        projAllocator.emplace_back(*proj);
+                        auto& patchedProj = projAllocator.back();
+
+                        projViewsAllocator.emplace_back(
+                            std::array<XrCompositionLayerProjectionView, 2>{proj->views[0], proj->views[1]});
+                        auto& patchedProjViews = projViewsAllocator.back();
+
+                        // Restore the original IPD, otherwise the OpenXR runtime will reproject the altered IPD
+                        // into the real IPD.
+                        overrideIPD(patchedProjViews[xr::StereoView::Left].pose,
+                                    patchedProjViews[xr::StereoView::Right].pose,
+                                    m_lastSeenIPD.value());
+
+                        for (uint32_t eye = 0; eye < xr::StereoView::Count; eye++) {
+                            TraceLoggingWrite(
+                                g_traceProvider,
+                                "xrEndFrame_Projection",
+                                TLArg(eye, "Index"),
+                                TLXArg(patchedProjViews[eye].subImage.swapchain, "Swapchain"),
+                                TLArg(patchedProjViews[eye].subImage.imageArrayIndex, "ImageArrayIndex"),
+                                TLArg(xr::ToString(patchedProjViews[eye].subImage.imageRect).c_str(), "ImageRect"),
+                                TLArg(xr::ToString(patchedProjViews[eye].pose).c_str(), "Pose"),
+                                TLArg(xr::ToString(patchedProjViews[eye].fov).c_str(), "Fov"));
+                        }
+
+                        patchedProj.views = projViewsAllocator.back().data();
+
+                        // Take our modified projection layer.
+                        layersPtrAllocator.push_back(reinterpret_cast<XrCompositionLayerBaseHeader*>(&patchedProj));
+                    } else {
+                        // Take the unmodified projection layer.
+                        layersPtrAllocator.push_back(frameEndInfo->layers[i]);
+                    }
+                } else {
+                    // Take the unmodified layer.
+                    layersPtrAllocator.push_back(frameEndInfo->layers[i]);
+                }
+            }
+
+            // Use our newly formed list of layers.
+            chainFrameEndInfo.layers = layersPtrAllocator.data();
+            assert(chainFrameEndInfo.layerCount == (uint32_t)layersPtrAllocator.size());
+
+            return OpenXrApi::xrEndFrame(session, &chainFrameEndInfo);
+        }
+
       private:
-        bool isSystemHandled(XrSystemId systemId) const {
-            return systemId == m_systemId;
+        float overrideIPD(XrPosef& leftEye, XrPosef& rightEye, float IPD) const {
+            const XrVector3f vec = leftEye.position - rightEye.position;
+            const XrVector3f center = leftEye.position + (vec * 0.5f);
+            const XrVector3f offset = Normalize(vec) * (IPD * 0.5f);
+            leftEye.position = center - offset;
+            rightEye.position = center + offset;
+
+            return Length(vec);
         }
 
         bool m_bypassApiLayer{false};
         XrSystemId m_systemId{XR_NULL_SYSTEM_ID};
+        std::optional<float> m_lastSeenIPD{};
     };
 
     // This method is required by the framework to instantiate your OpenXrApi implementation.
