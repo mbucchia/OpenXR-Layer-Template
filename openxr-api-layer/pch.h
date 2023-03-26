@@ -86,6 +86,7 @@ using Microsoft::WRL::ComPtr;
 #include <XrStereoView.h>
 #include <XrToString.h>
 #include <DirectXCollision.h>
+#include <DirectXTex.h>
 
 // FMT formatter.
 #include <fmt/format.h>

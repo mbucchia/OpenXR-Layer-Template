@@ -42,6 +42,15 @@ namespace openxr_api_layer {
     const std::vector<std::string> blockedExtensions = {};
     const std::vector<std::string> implicitExtensions = {};
 
+    const float Colors[][4] = {
+        {1.0f, 0.0f, 0.0f, 1.0f},
+        {0.0f, 1.0f, 0.0f, 1.0f},
+        {0.0f, 0.0f, 1.0f, 1.0f},
+        {1.0f, 1.0f, 0.0f, 1.0f},
+        {0.0f, 1.0f, 1.0f, 1.0f},
+        {1.0f, 0.0f, 1.0f, 1.0f},
+    };
+
     // This class implements our API layer.
     class OpenXrLayer : public openxr_api_layer::OpenXrApi {
       public:
@@ -63,6 +72,9 @@ namespace openxr_api_layer {
                 // Required to call this method for housekeeping.
                 if (m_compositionFrameworkFactory) {
                     m_compositionFrameworkFactory->xrGetInstanceProcAddr_post(instance, name, function);
+                }
+                if (m_inputFrameworkFactory) {
+                    m_inputFrameworkFactory->xrGetInstanceProcAddr_post(instance, name, function);
                 }
             } else {
                 result = m_xrGetInstanceProcAddr(instance, name, function);
@@ -120,9 +132,18 @@ namespace openxr_api_layer {
             TraceLoggingWrite(g_traceProvider, "xrCreateInstance", TLArg(runtimeName.c_str(), "RuntimeName"));
             Log(fmt::format("Using OpenXR runtime: {}\n", runtimeName));
 
-            // Initialize the composition framework factory.
+            // Initialize the composition & input framework factories.
             m_compositionFrameworkFactory = graphics::createCompositionFrameworkFactory(
                 *createInfo, GetXrInstance(), m_xrGetInstanceProcAddr, graphics::CompositionApi::D3D11);
+            m_inputFrameworkFactory =
+                inputs::createInputFrameworkFactory(*createInfo,
+                                                    GetXrInstance(),
+                                                    m_xrGetInstanceProcAddr,
+                                                    (utils::inputs::InputMethod::MotionControllerSpatial |
+                                                     utils::inputs::InputMethod::MotionControllerButtons));
+
+            // Needed by DirectXTex.
+            CoInitializeEx(nullptr, COINIT_MULTITHREADED);
 
             return XR_SUCCESS;
         }
@@ -168,123 +189,237 @@ namespace openxr_api_layer {
                               TLArg(frameEndInfo->layerCount, "LayerCount"));
 
             XrFrameEndInfo chainFrameEndInfo = *frameEndInfo;
-            std::vector<const XrCompositionLayerBaseHeader*> layers;
+            std::vector<const XrCompositionLayerBaseHeader*> layers(
+                chainFrameEndInfo.layers, chainFrameEndInfo.layers + chainFrameEndInfo.layerCount);
             XrCompositionLayerQuad overlay{XR_TYPE_COMPOSITION_LAYER_QUAD};
+            XrCompositionLayerQuad cursor{XR_TYPE_COMPOSITION_LAYER_QUAD};
+            bool needBlockApplicationInput = false;
 
             // Handle the overlay.
             graphics::ICompositionFramework* composition =
                 m_compositionFrameworkFactory->getCompositionFramework(session);
+            inputs::IInputFramework* inputs = m_inputFrameworkFactory->getInputFramework(session);
             if (composition) {
-                CompositionData* compositionData = composition->getSessionData<CompositionData>();
+                SessionData* sessionData = composition->getSessionData<SessionData>();
 
                 // First time: initialize the resources for the session.
-                if (!compositionData) {
-                    // Allocate storage for the state.
-                    composition->setSessionData(std::move(std::make_unique<CompositionData>(*this)));
-                    compositionData = composition->getSessionData<CompositionData>();
-
-                    // Create a swapchain for the overlay.
-                    XrSwapchainCreateInfo overlaySwapchainInfo{XR_TYPE_SWAPCHAIN_CREATE_INFO};
-                    overlaySwapchainInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
-                    overlaySwapchainInfo.arraySize = 1;
-                    overlaySwapchainInfo.width = 512;
-                    overlaySwapchainInfo.height = 512;
-                    overlaySwapchainInfo.format =
-                        composition->getPreferredSwapchainFormatOnApplicationDevice(overlaySwapchainInfo.usageFlags);
-                    overlaySwapchainInfo.mipCount = overlaySwapchainInfo.sampleCount = overlaySwapchainInfo.faceCount =
-                        1;
-                    compositionData->overlaySwapchain = composition->createSwapchain(
-                        overlaySwapchainInfo, graphics::SwapchainMode::Write | graphics::SwapchainMode::Submit);
-
-                    // Create a head-locked reference space.
-                    XrReferenceSpaceCreateInfo createViewSpaceInfo{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
-                    createViewSpaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
-                    createViewSpaceInfo.poseInReferenceSpace = Pose::Identity();
-                    CHECK_XRCMD(OpenXrApi::xrCreateReferenceSpace(
-                        composition->getSessionHandle(), &createViewSpaceInfo, &compositionData->viewSpace));
+                if (!sessionData) {
+                    // Allocate storage for the state and initialize it.
+                    composition->setSessionData(std::move(std::make_unique<SessionData>(*this, composition)));
+                    sessionData = composition->getSessionData<SessionData>();
                 }
 
-                // Draw the overlay content.
-                const XrSwapchainCreateInfo& swapchainInfo =
-                    compositionData->overlaySwapchain->getInfoOnCompositionDevice();
-                graphics::ISwapchainImage* const acquiredImage = compositionData->overlaySwapchain->acquireImage();
-                {
-                    ID3D11Device* const device =
-                        composition->getCompositionDevice()->getNativeDevice<graphics::D3D11>();
-                    ID3D11DeviceContext* const context =
-                        composition->getCompositionDevice()->getNativeContext<graphics::D3D11>();
-                    ID3D11Texture2D* const surface =
-                        acquiredImage->getTextureForWrite()->getNativeTexture<graphics::D3D11>();
-
-                    // Create an ephemeral render target view for the drawing.
-                    ComPtr<ID3D11RenderTargetView> rtv;
-                    D3D11_RENDER_TARGET_VIEW_DESC rtvDesc{};
-                    rtvDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
-                    rtvDesc.Format = (DXGI_FORMAT)swapchainInfo.format;
-                    rtvDesc.Texture2D.MipSlice = D3D11CalcSubresource(0, 0, 1);
-                    CHECK_HRCMD(device->CreateRenderTargetView(surface, &rtvDesc, rtv.ReleaseAndGetAddressOf()));
-
-                    // Draw to the surface.
-                    // We keep the drawing code very simple for the sake of the exercise, but really any D3D11 technique
-                    // could be used.
-                    ComPtr<ID3D11DeviceContext1> context1;
-                    CHECK_HRCMD(context->QueryInterface(context1.ReleaseAndGetAddressOf()));
-                    context1->OMSetRenderTargets(1, rtv.GetAddressOf(), nullptr);
-
-                    const float background[4] = {0.0f, 0.0f, 0.0f, 0.2f};
-                    const float red[4] = {1.0f, 0.0f, 0.0f, 1.0f};
-                    const float green[4] = {0.0f, 1.0f, 0.0f, 1.0f};
-                    context1->ClearRenderTargetView(rtv.Get(), background);
-
-                    D3D11_RECT rect1;
-                    rect1.left = 10;
-                    rect1.top = 10;
-                    rect1.right = swapchainInfo.width / 2 - 10;
-                    rect1.bottom = swapchainInfo.height - 10;
-                    context1->ClearView(rtv.Get(), red, &rect1, 1);
-
-                    D3D11_RECT rect2;
-                    rect2.left = swapchainInfo.width / 2 + 10;
-                    rect2.top = 10;
-                    rect2.right = swapchainInfo.width - 10;
-                    rect2.bottom = swapchainInfo.height - 10;
-                    context1->ClearView(rtv.Get(), green, &rect2, 1);
-
-                    ID3D11RenderTargetView* nullRTV = nullptr;
-                    context1->OMSetRenderTargets(1, &nullRTV, nullptr);
+                // Detect option button presses.
+                const bool wasOptionButtonPressed = sessionData->wasOptionButtonPressed;
+                sessionData->wasOptionButtonPressed =
+                    inputs->getMotionControllerButtonState(inputs::Hands::Left, (inputs::MotionControllerButton::Menu));
+                if (sessionData->wasOptionButtonPressed && !wasOptionButtonPressed) {
+                    sessionData->overlayVisible = !sessionData->overlayVisible;
                 }
-                compositionData->overlaySwapchain->releaseImage();
-                compositionData->overlaySwapchain->commitLastReleasedImage();
 
-                overlay.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
-                overlay.subImage = compositionData->overlaySwapchain->getSubImage();
+                if (sessionData->overlayVisible) {
+                    // Draw the overlay content.
+                    const XrSwapchainCreateInfo& swapchainInfo =
+                        sessionData->overlaySwapchain->getInfoOnCompositionDevice();
+                    D3D11_RECT rect1, rect2;
+                    graphics::ISwapchainImage* const acquiredImage = sessionData->overlaySwapchain->acquireImage();
+                    {
+                        ID3D11Device* const device =
+                            composition->getCompositionDevice()->getNativeDevice<graphics::D3D11>();
+                        ID3D11DeviceContext* const context =
+                            composition->getCompositionDevice()->getNativeContext<graphics::D3D11>();
+                        ID3D11Texture2D* const surface =
+                            acquiredImage->getTextureForWrite()->getNativeTexture<graphics::D3D11>();
 
-                // Place the overlay.
-                // - Head-locked, since we are using XR_REFERENCE_SPACE_TYPE_VIEW;
-                // - 1m in front of the user, facing the user (no rotation);
-                // - 0.8m x 0.6m dimensions.
-                overlay.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
-                overlay.pose = Pose::Translation({0.0f, 0.0f, -1.0f});
-                overlay.space = compositionData->viewSpace;
-                overlay.size.width = 0.8f;
-                overlay.size.height = 0.6f;
+                        // Create an ephemeral render target view for the drawing.
+                        ComPtr<ID3D11RenderTargetView> rtv;
+                        D3D11_RENDER_TARGET_VIEW_DESC rtvDesc{};
+                        rtvDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+                        rtvDesc.Format = (DXGI_FORMAT)swapchainInfo.format;
+                        rtvDesc.Texture2D.MipSlice = D3D11CalcSubresource(0, 0, 1);
+                        CHECK_HRCMD(device->CreateRenderTargetView(surface, &rtvDesc, rtv.ReleaseAndGetAddressOf()));
 
-                // Append our overlay quad layer.
-                layers.assign(chainFrameEndInfo.layers, chainFrameEndInfo.layers + chainFrameEndInfo.layerCount);
-                layers.push_back(reinterpret_cast<XrCompositionLayerBaseHeader*>(&overlay));
+                        // Draw to the surface.
+                        // We keep the drawing code very simple for the sake of the exercise, but really any D3D11
+                        // technique could be used.
+                        ComPtr<ID3D11DeviceContext1> context1;
+                        CHECK_HRCMD(context->QueryInterface(context1.ReleaseAndGetAddressOf()));
+                        context1->OMSetRenderTargets(1, rtv.GetAddressOf(), nullptr);
+
+                        const float background[4] = {0.0f, 0.0f, 0.0f, 0.2f};
+                        context1->ClearRenderTargetView(rtv.Get(), background);
+
+                        rect1.left = 10;
+                        rect1.top = 10;
+                        rect1.right = swapchainInfo.width / 2 - 10;
+                        rect1.bottom = swapchainInfo.height - 10;
+                        context1->ClearView(rtv.Get(), Colors[sessionData->colorIndex1], &rect1, 1);
+
+                        rect2.left = swapchainInfo.width / 2 + 10;
+                        rect2.top = 10;
+                        rect2.right = swapchainInfo.width - 10;
+                        rect2.bottom = swapchainInfo.height - 10;
+                        context1->ClearView(rtv.Get(), Colors[sessionData->colorIndex2], &rect2, 1);
+
+                        ID3D11RenderTargetView* nullRTV = nullptr;
+                        context1->OMSetRenderTargets(1, &nullRTV, nullptr);
+                    }
+                    sessionData->overlaySwapchain->releaseImage();
+                    sessionData->overlaySwapchain->commitLastReleasedImage();
+
+                    overlay.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+                    overlay.subImage = sessionData->overlaySwapchain->getSubImage();
+
+                    // Place the overlay.
+                    // - Head-locked, since we are using XR_REFERENCE_SPACE_TYPE_VIEW;
+                    // - 1m in front of the user, facing the user (no rotation);
+                    // - 0.8m x 0.6m dimensions.
+                    overlay.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+                    overlay.pose = Pose::Translation({0.0f, 0.0f, -1.0f});
+                    overlay.space = sessionData->viewSpace;
+                    overlay.size.width = 0.8f;
+                    overlay.size.height = 0.6f;
+
+                    // Append our overlay quad layer.
+                    layers.push_back(reinterpret_cast<XrCompositionLayerBaseHeader*>(&overlay));
+
+                    // Handle the cursor.
+                    XrPosef aimPose;
+                    if (Pose::IsPoseValid(
+                            inputs->locateMotionController(inputs::Hands::Left, sessionData->viewSpace, aimPose))) {
+                        // We will draw the cursor if and only if the controller aim hits close to the overlay (up
+                        // to 200px on each corner) outside.
+                        XrVector2f pixelsPerMeter = {overlay.subImage.imageRect.extent.width / overlay.size.width,
+                                                     overlay.subImage.imageRect.extent.height / overlay.size.height};
+                        XrPosef hitPose;
+                        if (general::hitTest(aimPose,
+                                             overlay.pose,
+                                             {(overlay.subImage.imageRect.extent.width + 400) / pixelsPerMeter.x,
+                                              (overlay.subImage.imageRect.extent.height + 400) / pixelsPerMeter.y},
+                                             hitPose)) {
+                            cursor.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+                            cursor.subImage = sessionData->cursorSwapchain->getSubImage();
+                            cursor.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+                            // Cursor position must not be centered on the cursor image, but instead top-left corner of
+                            // the cursor image.
+                            cursor.size.width = cursor.size.height = 0.1f;
+                            cursor.pose.position =
+                                hitPose.position + XrVector3f{cursor.size.width / 2.f, -cursor.size.height / 2.f, 0};
+                            // Cursor orientation can be two options:
+#if 1
+                            // 1) We present the cursor facing the camera.
+                            cursor.pose.orientation = Quaternion::Identity();
+#else
+                            // 2) We present the cursor stamped onto the overlay.
+                            cursor.pose.orientation = overlay.pose.orientation;
+#endif
+                            cursor.space = overlay.space;
+                            layers.push_back(reinterpret_cast<XrCompositionLayerBaseHeader*>(&cursor));
+
+                            // Block the application from receiving inputs.
+                            needBlockApplicationInput = true;
+
+                            // Handle cursor interactions. We do it here because we have all the information we
+                            // need, but this code could be moved elsewhere.
+                            //
+                            // Reuse our hittest result above, and relocate it to be relative to the top-left corner
+                            // of our overlay (like we used for drawing rect1 and rect2).
+                            const POINT cursorPos = general::getUVCoordinates(
+                                hitPose.position, overlay.pose, overlay.size, overlay.subImage.imageRect.extent);
+
+                            // Detect trigger presses.
+                            const bool wasTriggeredPressed = sessionData->wasTriggeredPressed;
+                            sessionData->wasTriggeredPressed = inputs->getMotionControllerButtonState(
+                                inputs::Hands::Left, (inputs::MotionControllerButton::Select));
+                            if (sessionData->wasTriggeredPressed && !wasTriggeredPressed) {
+                                // Determine if we clicked either rectangles.
+                                if (cursorPos.x > rect1.left && cursorPos.x < rect1.right && cursorPos.y > rect1.top &&
+                                    cursorPos.y < rect1.bottom) {
+                                    sessionData->colorIndex1 = (sessionData->colorIndex1 + 1) % std::size(Colors);
+                                }
+                                if (cursorPos.x > rect2.left && cursorPos.x < rect2.right && cursorPos.y > rect2.top &&
+                                    cursorPos.y < rect2.bottom) {
+                                    sessionData->colorIndex2 = (sessionData->colorIndex2 + 1) % std::size(Colors);
+                                }
+                            }
+                        } else {
+                            sessionData->wasTriggeredPressed = false;
+                        }
+                    }
+                }
+
                 chainFrameEndInfo.layers = layers.data();
                 chainFrameEndInfo.layerCount = (uint32_t)layers.size();
             }
+
+            // Make sure we never leave application inputs blocked for no reason.
+            inputs->blockApplicationInput(needBlockApplicationInput);
 
             return OpenXrApi::xrEndFrame(session, &chainFrameEndInfo);
         }
 
       private:
-        struct CompositionData : graphics::ICompositionSessionData {
-            CompositionData(OpenXrApi& openxr) : m_openxr(openxr) {
+        struct SessionData : graphics::ICompositionSessionData {
+            SessionData(OpenXrApi& openxr, graphics::ICompositionFramework* composition) : m_openxr(openxr) {
+                // Create a swapchain for the overlay.
+                XrSwapchainCreateInfo overlaySwapchainInfo{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+                overlaySwapchainInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+                overlaySwapchainInfo.arraySize = 1;
+                overlaySwapchainInfo.width = 512;
+                overlaySwapchainInfo.height = 512;
+                overlaySwapchainInfo.format =
+                    composition->getPreferredSwapchainFormatOnApplicationDevice(overlaySwapchainInfo.usageFlags);
+                overlaySwapchainInfo.mipCount = overlaySwapchainInfo.sampleCount = overlaySwapchainInfo.faceCount = 1;
+                overlaySwapchain = composition->createSwapchain(
+                    overlaySwapchainInfo, graphics::SwapchainMode::Write | graphics::SwapchainMode::Submit);
+
+                // Create the cursor.
+                {
+                    ID3D11Device* const device =
+                        composition->getCompositionDevice()->getNativeDevice<graphics::D3D11>();
+
+                    auto image = std::make_unique<DirectX::ScratchImage>();
+                    CHECK_HRCMD(DirectX::LoadFromWICFile(
+                        (dllHome / L"cursor.png").c_str(), DirectX::WIC_FLAGS_NONE, nullptr, *image));
+
+                    ComPtr<ID3D11Resource> cursorTexture;
+                    CHECK_HRCMD(DirectX::CreateTexture(
+                        device, image->GetImages(), 1, image->GetMetadata(), cursorTexture.ReleaseAndGetAddressOf()));
+
+                    XrSwapchainCreateInfo cursorSwapchainInfo{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+                    cursorSwapchainInfo.createFlags = XR_SWAPCHAIN_CREATE_STATIC_IMAGE_BIT;
+                    cursorSwapchainInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+                    cursorSwapchainInfo.arraySize = 1;
+                    cursorSwapchainInfo.format = static_cast<int64_t>(image->GetMetadata().format);
+                    cursorSwapchainInfo.width = static_cast<int32_t>(image->GetMetadata().width);
+                    cursorSwapchainInfo.height = static_cast<int32_t>(image->GetMetadata().height);
+                    cursorSwapchainInfo.mipCount = cursorSwapchainInfo.sampleCount = cursorSwapchainInfo.faceCount = 1;
+                    cursorSwapchain = composition->createSwapchain(
+                        cursorSwapchainInfo, graphics::SwapchainMode::Write | graphics::SwapchainMode::Submit);
+
+                    // Draw our static content.
+                    graphics::ISwapchainImage* const acquiredImage = cursorSwapchain->acquireImage();
+                    {
+                        ID3D11DeviceContext* const context =
+                            composition->getCompositionDevice()->getNativeContext<graphics::D3D11>();
+                        ID3D11Texture2D* const surface =
+                            acquiredImage->getTextureForWrite()->getNativeTexture<graphics::D3D11>();
+
+                        context->CopyResource(surface, cursorTexture.Get());
+                    }
+                    cursorSwapchain->releaseImage();
+                    cursorSwapchain->commitLastReleasedImage();
+                }
+
+                // Create a head-locked reference space.
+                XrReferenceSpaceCreateInfo createViewSpaceInfo{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+                createViewSpaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
+                createViewSpaceInfo.poseInReferenceSpace = Pose::Identity();
+                CHECK_XRCMD(
+                    m_openxr.xrCreateReferenceSpace(composition->getSessionHandle(), &createViewSpaceInfo, &viewSpace));
             }
 
-            ~CompositionData() override {
+            ~SessionData() override {
                 if (viewSpace != XR_NULL_HANDLE) {
                     m_openxr.xrDestroySpace(viewSpace);
                 }
@@ -292,6 +427,12 @@ namespace openxr_api_layer {
 
             XrSpace viewSpace{XR_NULL_HANDLE};
             std::shared_ptr<graphics::ISwapchain> overlaySwapchain;
+            bool overlayVisible{true};
+            std::shared_ptr<graphics::ISwapchain> cursorSwapchain;
+            bool wasTriggeredPressed{false};
+            bool wasOptionButtonPressed{false};
+            uint32_t colorIndex1{0};
+            uint32_t colorIndex2{1};
 
           private:
             OpenXrApi& m_openxr;
@@ -300,6 +441,7 @@ namespace openxr_api_layer {
         bool m_bypassApiLayer{false};
 
         std::shared_ptr<graphics::ICompositionFrameworkFactory> m_compositionFrameworkFactory;
+        std::shared_ptr<inputs::IInputFrameworkFactory> m_inputFrameworkFactory;
     };
 
     // This method is required by the framework to instantiate your OpenXrApi implementation.
