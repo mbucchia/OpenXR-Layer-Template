@@ -58,6 +58,7 @@ using namespace std::chrono_literals;
 #include <wil/resource.h>
 #include <traceloggingactivity.h>
 #include <traceloggingprovider.h>
+#include <TlHelp32.h>
 
 using Microsoft::WRL::ComPtr;
 
@@ -69,6 +70,7 @@ using Microsoft::WRL::ComPtr;
 #ifdef XR_USE_GRAPHICS_API_D3D12
 #include <d3d12.h>
 #endif
+#include <d3dcompiler.h>
 
 // OpenXR + Windows-specific definitions.
 #define XR_NO_PROTOTYPES
@@ -96,3 +98,9 @@ using Microsoft::WRL::ComPtr;
 #endif
 
 #include <utils/inputs.h>
+
+// Needed for capture.
+#include <winrt/windows.foundation.h>
+#include <winrt/windows.graphics.capture.h>
+#include <windows.graphics.capture.interop.h>
+#include <winrt/windows.graphics.directx.direct3d11.h>

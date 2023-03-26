@@ -29,6 +29,10 @@
 #include <log.h>
 #include <util.h>
 
+#include "capture.h"
+
+#pragma comment(lib, "d3dcompiler.lib")
+
 namespace openxr_api_layer {
 
     using namespace log;
@@ -41,6 +45,51 @@ namespace openxr_api_layer {
     // Initialize these vectors with arrays of extensions to block and implicitly request for the instance.
     const std::vector<std::string> blockedExtensions = {};
     const std::vector<std::string> implicitExtensions = {};
+
+    // The process to start to create the overlay window.
+    const std::wstring OverlayProcessName = L"WindowsFormsApp.exe";
+
+    // A shader that makes a color transparent.
+    const std::string_view TransparencyShaderHlsl =
+        R"_(
+cbuffer config : register(b0) {
+    float3 TransparentColor;
+    float Transparency;
+};
+Texture2D in_texture : register(t0);
+RWTexture2D<float4> out_texture : register(u0);
+
+[numthreads(8, 8, 1)]
+void main(uint2 pos : SV_DispatchThreadID)
+{
+    float alpha = (all(in_texture[pos].rgb == TransparentColor)) ? Transparency : 1.f;
+    out_texture[pos] = float4(in_texture[pos].rgb, alpha);
+}
+    )_";
+
+    struct TransparencyShaderConstants {
+        XrVector3f transparentColor;
+        float transparencyLevel;
+    };
+
+    // https://stackoverflow.com/questions/7956519/how-to-kill-processes-by-name-win32-api
+    void killProcessByName(const std::wstring& filename) {
+        HANDLE hSnapShot = CreateToolhelp32Snapshot(TH32CS_SNAPALL, NULL);
+        PROCESSENTRY32 pEntry{sizeof(pEntry)};
+        BOOL hRes = Process32First(hSnapShot, &pEntry);
+        while (hRes) {
+            const std::wstring_view exeFile(pEntry.szExeFile);
+            if (exeFile == filename) {
+                HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, 0, (DWORD)pEntry.th32ProcessID);
+                if (hProcess != NULL) {
+                    TerminateProcess(hProcess, 9);
+                    CloseHandle(hProcess);
+                }
+            }
+            hRes = Process32Next(hSnapShot, &pEntry);
+        }
+        CloseHandle(hSnapShot);
+    }
 
     // This class implements our API layer.
     class OpenXrLayer : public openxr_api_layer::OpenXrApi {
@@ -124,6 +173,9 @@ namespace openxr_api_layer {
             m_compositionFrameworkFactory = graphics::createCompositionFrameworkFactory(
                 *createInfo, GetXrInstance(), m_xrGetInstanceProcAddr, graphics::CompositionApi::D3D11);
 
+            // Terminate any prior overlay window process.
+            killProcessByName(OverlayProcessName);
+
             return XR_SUCCESS;
         }
 
@@ -168,133 +220,309 @@ namespace openxr_api_layer {
                               TLArg(frameEndInfo->layerCount, "LayerCount"));
 
             XrFrameEndInfo chainFrameEndInfo = *frameEndInfo;
-            std::vector<const XrCompositionLayerBaseHeader*> layers;
+            std::vector<const XrCompositionLayerBaseHeader*> layers(
+                chainFrameEndInfo.layers, chainFrameEndInfo.layers + chainFrameEndInfo.layerCount);
             XrCompositionLayerQuad overlay{XR_TYPE_COMPOSITION_LAYER_QUAD};
 
             // Handle the overlay.
             graphics::ICompositionFramework* composition =
                 m_compositionFrameworkFactory->getCompositionFramework(session);
             if (composition) {
-                CompositionData* compositionData = composition->getSessionData<CompositionData>();
+                SessionData* sessionData = composition->getSessionData<SessionData>();
 
                 // First time: initialize the resources for the session.
-                if (!compositionData) {
+                if (!sessionData) {
                     // Allocate storage for the state.
-                    composition->setSessionData(std::move(std::make_unique<CompositionData>(*this)));
-                    compositionData = composition->getSessionData<CompositionData>();
-
-                    // Create a swapchain for the overlay.
-                    XrSwapchainCreateInfo overlaySwapchainInfo{XR_TYPE_SWAPCHAIN_CREATE_INFO};
-                    overlaySwapchainInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
-                    overlaySwapchainInfo.arraySize = 1;
-                    overlaySwapchainInfo.width = 512;
-                    overlaySwapchainInfo.height = 512;
-                    overlaySwapchainInfo.format =
-                        composition->getPreferredSwapchainFormatOnApplicationDevice(overlaySwapchainInfo.usageFlags);
-                    overlaySwapchainInfo.mipCount = overlaySwapchainInfo.sampleCount = overlaySwapchainInfo.faceCount =
-                        1;
-                    compositionData->overlaySwapchain = composition->createSwapchain(
-                        overlaySwapchainInfo, graphics::SwapchainMode::Write | graphics::SwapchainMode::Submit);
-
-                    // Create a head-locked reference space.
-                    XrReferenceSpaceCreateInfo createViewSpaceInfo{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
-                    createViewSpaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
-                    createViewSpaceInfo.poseInReferenceSpace = Pose::Identity();
-                    CHECK_XRCMD(OpenXrApi::xrCreateReferenceSpace(
-                        composition->getSessionHandle(), &createViewSpaceInfo, &compositionData->viewSpace));
+                    composition->setSessionData(std::move(std::make_unique<SessionData>(*this, composition)));
+                    sessionData = composition->getSessionData<SessionData>();
                 }
 
-                // Draw the overlay content.
-                const XrSwapchainCreateInfo& swapchainInfo =
-                    compositionData->overlaySwapchain->getInfoOnCompositionDevice();
-                graphics::ISwapchainImage* const acquiredImage = compositionData->overlaySwapchain->acquireImage();
-                {
-                    ID3D11Device* const device =
-                        composition->getCompositionDevice()->getNativeDevice<graphics::D3D11>();
-                    ID3D11DeviceContext* const context =
-                        composition->getCompositionDevice()->getNativeContext<graphics::D3D11>();
-                    ID3D11Texture2D* const surface =
-                        acquiredImage->getTextureForWrite()->getNativeTexture<graphics::D3D11>();
+                // Refresh the content of the overlay.
+                if (sessionData->captureOverlayWindow(composition)) {
+                    // Place the overlay.
+                    overlay.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+                    overlay.subImage = sessionData->overlaySwapchain->getSubImage();
+                    overlay.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+                    overlay.pose = sessionData->overlayPose;
+                    overlay.space = sessionData->localSpace;
+                    overlay.size = sessionData->overlaySize;
 
-                    // Create an ephemeral render target view for the drawing.
-                    ComPtr<ID3D11RenderTargetView> rtv;
-                    D3D11_RENDER_TARGET_VIEW_DESC rtvDesc{};
-                    rtvDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
-                    rtvDesc.Format = (DXGI_FORMAT)swapchainInfo.format;
-                    rtvDesc.Texture2D.MipSlice = D3D11CalcSubresource(0, 0, 1);
-                    CHECK_HRCMD(device->CreateRenderTargetView(surface, &rtvDesc, rtv.ReleaseAndGetAddressOf()));
-
-                    // Draw to the surface.
-                    // We keep the drawing code very simple for the sake of the exercise, but really any D3D11 technique
-                    // could be used.
-                    ComPtr<ID3D11DeviceContext1> context1;
-                    CHECK_HRCMD(context->QueryInterface(context1.ReleaseAndGetAddressOf()));
-                    context1->OMSetRenderTargets(1, rtv.GetAddressOf(), nullptr);
-
-                    const float background[4] = {0.0f, 0.0f, 0.0f, 0.2f};
-                    const float red[4] = {1.0f, 0.0f, 0.0f, 1.0f};
-                    const float green[4] = {0.0f, 1.0f, 0.0f, 1.0f};
-                    context1->ClearRenderTargetView(rtv.Get(), background);
-
-                    D3D11_RECT rect1;
-                    rect1.left = 10;
-                    rect1.top = 10;
-                    rect1.right = swapchainInfo.width / 2 - 10;
-                    rect1.bottom = swapchainInfo.height - 10;
-                    context1->ClearView(rtv.Get(), red, &rect1, 1);
-
-                    D3D11_RECT rect2;
-                    rect2.left = swapchainInfo.width / 2 + 10;
-                    rect2.top = 10;
-                    rect2.right = swapchainInfo.width - 10;
-                    rect2.bottom = swapchainInfo.height - 10;
-                    context1->ClearView(rtv.Get(), green, &rect2, 1);
-
-                    ID3D11RenderTargetView* nullRTV = nullptr;
-                    context1->OMSetRenderTargets(1, &nullRTV, nullptr);
+                    // Append our overlay quad layer.
+                    layers.push_back(reinterpret_cast<XrCompositionLayerBaseHeader*>(&overlay));
                 }
-                compositionData->overlaySwapchain->releaseImage();
-                compositionData->overlaySwapchain->commitLastReleasedImage();
-
-                overlay.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
-                overlay.subImage = compositionData->overlaySwapchain->getSubImage();
-
-                // Place the overlay.
-                // - Head-locked, since we are using XR_REFERENCE_SPACE_TYPE_VIEW;
-                // - 1m in front of the user, facing the user (no rotation);
-                // - 0.8m x 0.6m dimensions.
-                overlay.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
-                overlay.pose = Pose::Translation({0.0f, 0.0f, -1.0f});
-                overlay.space = compositionData->viewSpace;
-                overlay.size.width = 0.8f;
-                overlay.size.height = 0.6f;
-
-                // Append our overlay quad layer.
-                layers.assign(chainFrameEndInfo.layers, chainFrameEndInfo.layers + chainFrameEndInfo.layerCount);
-                layers.push_back(reinterpret_cast<XrCompositionLayerBaseHeader*>(&overlay));
-                chainFrameEndInfo.layers = layers.data();
-                chainFrameEndInfo.layerCount = (uint32_t)layers.size();
             }
+
+            chainFrameEndInfo.layers = layers.data();
+            chainFrameEndInfo.layerCount = (uint32_t)layers.size();
 
             return OpenXrApi::xrEndFrame(session, &chainFrameEndInfo);
         }
 
       private:
-        struct CompositionData : graphics::ICompositionSessionData {
-            CompositionData(OpenXrApi& openxr) : m_openxr(openxr) {
+        struct SessionData : graphics::ICompositionSessionData {
+            SessionData(OpenXrApi& openxr, graphics::ICompositionFramework* composition) : m_openxr(openxr) {
+                // Create the resources for the transparency shader
+                ID3D11Device* const device = composition->getCompositionDevice()->getNativeDevice<graphics::D3D11>();
+                const auto compileShader =
+                    [&](const std::string_view& code, const std::string_view& entry, ID3D11ComputeShader** shader) {
+                        ComPtr<ID3DBlob> shaderBytes;
+                        ComPtr<ID3DBlob> errMsgs;
+                        DWORD flags = D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_WARNINGS_ARE_ERRORS;
+#ifdef _DEBUG
+                        flags |= D3DCOMPILE_SKIP_OPTIMIZATION | D3DCOMPILE_DEBUG;
+#else
+                        flags |= D3DCOMPILE_OPTIMIZATION_LEVEL3;
+#endif
+
+                        const HRESULT hr = D3DCompile(code.data(),
+                                                      code.size(),
+                                                      nullptr,
+                                                      nullptr,
+                                                      nullptr,
+                                                      entry.data(),
+                                                      "cs_5_0",
+                                                      flags,
+                                                      0,
+                                                      shaderBytes.ReleaseAndGetAddressOf(),
+                                                      errMsgs.ReleaseAndGetAddressOf());
+                        if (FAILED(hr)) {
+                            std::string errMsg((const char*)errMsgs->GetBufferPointer(), errMsgs->GetBufferSize());
+                            ErrorLog("D3DCompile failed %X: %s\n", hr, errMsg.c_str());
+                            CHECK_HRESULT(hr, "D3DCompile failed");
+                        }
+                        CHECK_HRCMD(device->CreateComputeShader(
+                            shaderBytes->GetBufferPointer(), shaderBytes->GetBufferSize(), nullptr, shader));
+                    };
+
+                compileShader(TransparencyShaderHlsl, "main", m_transparencyShader.ReleaseAndGetAddressOf());
+
+                // Pick the color to make transparent.
+                TransparencyShaderConstants transparencyParams{};
+                transparencyParams.transparentColor = {255 / 255.f, 0 / 255.f, 255 / 255.f};
+                D3D11_BUFFER_DESC desc{};
+                desc.ByteWidth = sizeof(transparencyParams);
+                desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+                desc.Usage = D3D11_USAGE_DYNAMIC;
+                desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+                D3D11_SUBRESOURCE_DATA data{};
+                data.pSysMem = &transparencyParams;
+                CHECK_HRCMD(device->CreateBuffer(&desc, &data, m_transparencyConstants.ReleaseAndGetAddressOf()));
+
+                // Create a head-locked reference space.
+                XrReferenceSpaceCreateInfo createViewSpaceInfo{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+                createViewSpaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
+                createViewSpaceInfo.poseInReferenceSpace = Pose::Identity();
+                CHECK_XRCMD(m_openxr.xrCreateReferenceSpace(
+                    composition->getSessionHandle(), &createViewSpaceInfo, &localSpace));
+
+                // Pick an initial pose.
+                overlayPose = Pose::Translation({0, 0, -1});
+                overlaySize = {1.f, 1.f};
             }
 
-            ~CompositionData() override {
-                if (viewSpace != XR_NULL_HANDLE) {
-                    m_openxr.xrDestroySpace(viewSpace);
+            ~SessionData() override {
+                if (m_overlayProcessInfo.dwProcessId != 0) {
+                    PostThreadMessage(m_overlayProcessInfo.dwThreadId, WM_QUIT, 0, 0);
+                }
+
+                if (localSpace != XR_NULL_HANDLE) {
+                    m_openxr.xrDestroySpace(localSpace);
                 }
             }
 
-            XrSpace viewSpace{XR_NULL_HANDLE};
+            bool captureOverlayWindow(graphics::ICompositionFramework* composition) {
+                // See if the overlay process is already started.
+                if (m_overlayProcessInfo.dwProcessId != 0) {
+                    if (!WaitForSingleObject(m_overlayProcessInfo.hProcess, 0)) {
+                        // Destroy all resources for the process.
+                        m_captureWindow.reset();
+                        overlaySwapchain.reset();
+                        CloseHandle(m_overlayProcessInfo.hThread);
+                        CloseHandle(m_overlayProcessInfo.hProcess);
+
+                        // Mark as finished.
+                        m_overlayProcessInfo = {};
+                    }
+                }
+
+                // Start the process if needed.
+                if (m_overlayProcessInfo.dwProcessId == 0) {
+                    STARTUPINFO info = {sizeof(info)};
+                    if (!CreateProcess((dllHome / OverlayProcessName).wstring().c_str(),
+                                       nullptr,
+                                       nullptr,
+                                       nullptr,
+                                       FALSE,
+                                       0,
+                                       nullptr,
+                                       nullptr,
+                                       &info,
+                                       &m_overlayProcessInfo)) {
+                        static bool logged = false;
+                        if (!logged) {
+                            Log(fmt::format("Failed to start overlay process: {}\n", GetLastError()));
+                            logged = true;
+                        }
+                        return false;
+                    }
+                }
+
+                // Find the window to duplicate.
+                struct WindowLookup {
+                    DWORD processId;
+                    HWND windowToDuplicate{0};
+                } windowLookup;
+                windowLookup.processId = m_overlayProcessInfo.dwProcessId;
+                EnumWindows(
+                    [](HWND hwnd, LPARAM lParam) {
+                        WindowLookup* lookup = (WindowLookup*)lParam;
+
+                        if (hwnd == nullptr || hwnd == GetShellWindow() || !IsWindowVisible(hwnd) ||
+                            GetAncestor(hwnd, GA_ROOT) != hwnd || GetWindowLongPtr(hwnd, GWL_STYLE) & WS_DISABLED) {
+                            return TRUE;
+                        }
+
+                    // Here we demonstrate 2 ways to capture a window:
+#if 1
+                        // 1) By process ID that we started above.
+                        DWORD processId;
+                        GetWindowThreadProcessId(hwnd, &processId);
+                        if (processId != lookup->processId) {
+                            return TRUE;
+                        }
+#else
+                        // 2) By window title.
+                        wchar_t text[256];
+                        if (GetWindowText(hwnd, text, sizeof(text) / sizeof(wchar_t)) == 0) {
+                            return TRUE;
+                        }
+                        std::wstring_view windowTitle(text);
+                        // TODO: Put the title of the window you want to capture!
+                        if (windowTitle != L"OverlayForm") {
+                            return TRUE;
+                        }
+#endif
+                        lookup->windowToDuplicate = hwnd;
+                        return FALSE;
+                    },
+                    (LPARAM)&windowLookup);
+
+                if (!windowLookup.windowToDuplicate) {
+                    m_captureWindow.reset();
+                    overlaySwapchain.reset();
+                    return false;
+                }
+
+                ID3D11Device* const device = composition->getCompositionDevice()->getNativeDevice<graphics::D3D11>();
+
+                // Open the shared surface.
+                if (!m_captureWindow) {
+                    // Here we demonstrate 2 ways to capture a window:
+#if 0
+                    // 1) Using DWM internal API.
+                    m_captureWindow =
+                        std::make_shared<capture::CaptureWindowDWM>(device, windowLookup.windowToDuplicate);
+#else
+                    // 2) Using WinRT API.
+                    m_captureWindow =
+                        std::make_shared<capture::CaptureWindowWinRT>(device, windowLookup.windowToDuplicate);
+#endif
+                }
+                ID3D11Texture2D* const windowSurface = m_captureWindow->getSurface();
+                if (!windowSurface) {
+                    return false;
+                }
+
+                // (re)Create the swapchain if needed.
+                D3D11_TEXTURE2D_DESC windowSharedSurfaceDesc;
+                windowSurface->GetDesc(&windowSharedSurfaceDesc);
+                if (!overlaySwapchain ||
+                    overlaySwapchain->getInfoOnCompositionDevice().width != windowSharedSurfaceDesc.Width ||
+                    overlaySwapchain->getInfoOnCompositionDevice().height != windowSharedSurfaceDesc.Height) {
+                    // Create a swapchain for the overlay.
+                    XrSwapchainCreateInfo overlaySwapchainInfo{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+                    overlaySwapchainInfo.usageFlags = XR_SWAPCHAIN_USAGE_UNORDERED_ACCESS_BIT;
+                    overlaySwapchainInfo.arraySize = 1;
+                    overlaySwapchainInfo.width = windowSharedSurfaceDesc.Width;
+                    overlaySwapchainInfo.height = windowSharedSurfaceDesc.Height;
+                    overlaySwapchainInfo.format =
+                        composition->getCompositionDevice()->translateFromGenericFormat(DXGI_FORMAT_R8G8B8A8_UNORM);
+                    overlaySwapchainInfo.mipCount = 1;
+                    overlaySwapchainInfo.sampleCount = 1;
+                    overlaySwapchainInfo.faceCount = 1;
+                    overlaySwapchain = composition->createSwapchain(
+                        overlaySwapchainInfo, graphics::SwapchainMode::Write | graphics::SwapchainMode::Submit);
+
+                    // Keep aspect ratio.
+                    overlaySize.height =
+                        overlaySize.width * ((float)overlaySwapchainInfo.height / overlaySwapchainInfo.width);
+                }
+
+                // Copy the most recent window content into the swapchain.
+                graphics::ISwapchainImage* const acquiredImage = overlaySwapchain->acquireImage();
+                {
+                    ID3D11DeviceContext* const context =
+                        composition->getCompositionDevice()->getNativeContext<graphics::D3D11>();
+                    ID3D11Texture2D* const surface =
+                        acquiredImage->getTextureForWrite()->getNativeTexture<graphics::D3D11>();
+
+                    // Create ephemeral resources to run our transparency shader.
+                    ComPtr<ID3D11ShaderResourceView> srv;
+                    {
+                        D3D11_SHADER_RESOURCE_VIEW_DESC desc{};
+                        desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+                        desc.Format = windowSharedSurfaceDesc.Format;
+                        desc.Texture2D.MipLevels = 1;
+                        CHECK_HRCMD(
+                            device->CreateShaderResourceView(windowSurface, &desc, srv.ReleaseAndGetAddressOf()));
+                    }
+                    ComPtr<ID3D11UnorderedAccessView> uav;
+                    {
+                        D3D11_UNORDERED_ACCESS_VIEW_DESC desc{};
+                        desc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+                        desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                        desc.Texture2D.MipSlice = 0;
+                        CHECK_HRCMD(device->CreateUnorderedAccessView(surface, &desc, uav.ReleaseAndGetAddressOf()));
+                    }
+
+                    // Copy while doing transparency.
+                    context->CSSetShader(m_transparencyShader.Get(), nullptr, 0);
+                    context->CSSetShaderResources(0, 1, srv.GetAddressOf());
+                    context->CSSetConstantBuffers(0, 1, m_transparencyConstants.GetAddressOf());
+                    context->CSSetUnorderedAccessViews(0, 1, uav.GetAddressOf(), nullptr);
+                    context->Dispatch((unsigned int)std::ceil(windowSharedSurfaceDesc.Width / 8),
+                                      (unsigned int)std::ceil(windowSharedSurfaceDesc.Height / 8),
+                                      1);
+
+                    // Unbind all resources to avoid D3D validation errors.
+                    {
+                        context->CSSetShader(nullptr, nullptr, 0);
+                        ID3D11ShaderResourceView* nullSRV[] = {nullptr};
+                        context->CSSetShaderResources(0, 1, nullSRV);
+                        ID3D11Buffer* nullCBV[] = {nullptr};
+                        context->CSSetConstantBuffers(0, 1, nullCBV);
+                        ID3D11UnorderedAccessView* nullUAV[] = {nullptr};
+                        context->CSSetUnorderedAccessViews(0, 1, nullUAV, nullptr);
+                    }
+                }
+                overlaySwapchain->releaseImage();
+                overlaySwapchain->commitLastReleasedImage();
+
+                return true;
+            }
+
+            XrSpace localSpace{XR_NULL_HANDLE};
             std::shared_ptr<graphics::ISwapchain> overlaySwapchain;
+            XrPosef overlayPose;
+            XrExtent2Df overlaySize;
 
           private:
             OpenXrApi& m_openxr;
+
+            ComPtr<ID3D11ComputeShader> m_transparencyShader;
+            PROCESS_INFORMATION m_overlayProcessInfo{};
+            std::shared_ptr<capture::ICaptureWindow> m_captureWindow;
+            ComPtr<ID3D11Buffer> m_transparencyConstants;
         };
 
         bool m_bypassApiLayer{false};
