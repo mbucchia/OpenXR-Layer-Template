@@ -53,6 +53,8 @@ namespace {
     using namespace openxr_api_layer::utils::inputs;
     using namespace xr::math;
 
+    constexpr float ThumbstickDeadzone = 0.2f;
+
     struct FrameworkActions {
         XrActionSet actionSet{XR_NULL_HANDLE};
         XrAction aimAction{XR_NULL_HANDLE};
@@ -304,14 +306,20 @@ namespace {
             XrActionStateVector2f state{XR_TYPE_ACTION_STATE_VECTOR2F};
             CHECK_XRCMD(xrGetActionStateVector2f(m_session, &actionInfo, &state));
 
-            TraceLoggingWriteStart(
+            TraceLoggingWriteStop(
                 local,
                 "InputFramework_GetMotionControllerThumbstickState",
                 TLArg(!!state.isActive, "IsActive"),
                 TLArg(fmt::format("x:{}, y:{}", state.currentState.x, state.currentState.y).c_str(), "State"));
 
             if (state.isActive) {
-                return state.currentState;
+                const float length = std::sqrt(state.currentState.x * state.currentState.x +
+                                               state.currentState.y * state.currentState.y);
+                if (length >= ThumbstickDeadzone) {
+                    XrVector2f normalizedInput{state.currentState.x / length, state.currentState.y / length};
+                    const float scaling = (length - ThumbstickDeadzone) / (1 - ThumbstickDeadzone);
+                    return {normalizedInput.x * scaling, normalizedInput.y * scaling};
+                }
             }
             return {0, 0};
         }

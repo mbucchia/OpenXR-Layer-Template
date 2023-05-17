@@ -34,6 +34,8 @@
 #include <algorithm>
 #include <cstdarg>
 #include <ctime>
+#define _USE_MATH_DEFINES
+#include <cmath>
 #include <deque>
 #include <iomanip>
 #include <iostream>
