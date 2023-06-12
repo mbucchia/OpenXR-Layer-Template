@@ -908,7 +908,7 @@ namespace {
                 {"/interaction_profiles/htc/vive_controller",            true,  true,  "/input/trigger", "/input/menu",     "/input/squeeze", "/input/trackpad"},
                 {"/interaction_profiles/microsoft/motion_controller",    true,  true,  "/input/trigger", "/input/menu",     "/input/squeeze", "/input/thumbstick"},
                 {"/interaction_profiles/oculus/touch_controller",        true,  true,  "/input/trigger", "left/input/menu", "/input/squeeze", "/input/thumbstick"},
-                {"/interaction_profiles/valve/index_controller",         true,  true,  "/input/trigger", "/input/a/click",        "/input/squeeze", "/input/thumbstick"},
+                {"/interaction_profiles/valve/index_controller",         true,  true,  "/input/trigger", "/input/a/click",  "/input/squeeze", "/input/thumbstick"},
                 {"/interaction_profiles/hp/mixed_reality_controller",    true,  true,  "/input/trigger", "/input/menu",     "/input/squeeze", "/input/thumbstick"},
                 {"/interaction_profiles/bytedance/pico_neo3_controller", true,  true,  "/input/trigger", "/input/menu",     "/input/squeeze", "/input/thumbstick"},
                 {"/interaction_profiles/bytedance/pico4_controller",     true,  true,  "/input/trigger", "left/input/menu", "/input/squeeze", "/input/thumbstick"},
