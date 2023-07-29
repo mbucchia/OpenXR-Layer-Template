@@ -33,6 +33,9 @@ namespace openxr_api_layer {
 
     using namespace log;
 
+    // Our API layer implement these extensions, and their specified version.
+    const std::vector<std::pair<std::string, uint32_t>> advertisedExtensions = {};
+
     // Initialize these vectors with arrays of extensions to block and implicitly request for the instance.
     const std::vector<std::string> blockedExtensions = {};
     const std::vector<std::string> implicitExtensions = {};
